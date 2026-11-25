@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import logging
 import subprocess
@@ -30,7 +31,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 
-# ---------- Web ping server (Render-க்கு) ----------
+# ---------- Web ping server (Render) ----------
 class Ping(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -47,7 +48,6 @@ def start_web():
 
 
 def keep_alive():
-    # ஒவ்வொரு 10 நிமிஷத்துக்கும் தன்னையே ping பண்ணி, Telegram-க்கு message அனுப்பும்
     while True:
         time.sleep(600)
         try:
@@ -73,6 +73,9 @@ IG_USERNAME = os.getenv("IG_USERNAME")
 IG_PASSWORD = os.getenv("IG_PASSWORD")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# Groq model. Render env-ல GROQ_MODEL வச்சா அதை எடுக்கும்.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+
 threading.Thread(target=keep_alive, daemon=True).start()
 
 IG_SESSION_FILE = "ig_session.json"
@@ -88,38 +91,76 @@ MUSIC_FILE = "music.mp3"
 
 state = {"yt": True, "ig": True}
 
+# பல போட்டோ album-ஆ வந்தா சேர்த்து வைக்க
+albums = {}
 
-# ---------- Reel + Caption ----------
-def make_reel(photo_path, output_path, music_path=None, duration=15):
+
+# ---------- Reel (single photo or slideshow) ----------
+def make_reel(photo_paths, output_path, music_path=None, sec_per_photo=3):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    vf = (
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
-    )
-    cmd = [ffmpeg, "-y", "-loop", "1", "-i", photo_path]
+    if isinstance(photo_paths, str):
+        photo_paths = [photo_paths]
+    if len(photo_paths) == 1:
+        sec_per_photo = 12
+    n = len(photo_paths)
+    total = n * sec_per_photo
+
+    cmd = [ffmpeg, "-y"]
+    for p in photo_paths:
+        cmd += ["-loop", "1", "-t", str(sec_per_photo), "-i", p]
     if music_path:
-        cmd += ["-i", music_path]
-    cmd += ["-vf", vf, "-c:v", "libx264", "-t", str(duration), "-r", "30"]
+        cmd += ["-stream_loop", "-1", "-i", music_path]
+
+    filters_ = []
+    for i in range(n):
+        filters_.append(
+            f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
+            f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v{i}]"
+        )
+    concat_in = "".join(f"[v{i}]" for i in range(n))
+    filters_.append(f"{concat_in}concat=n={n}:v=1:a=0[outv]")
+
+    cmd += ["-filter_complex", ";".join(filters_), "-map", "[outv]"]
     if music_path:
-        cmd += ["-c:a", "aac", "-shortest"]
-    cmd += [output_path]
+        cmd += ["-map", f"{n}:a", "-c:a", "aac", "-shortest"]
+    cmd += ["-c:v", "libx264", "-t", str(total), "-movflags", "+faststart", output_path]
     subprocess.run(cmd, check=True)
     return output_path
 
 
+# ---------- AI caption (mood தானா தேர்ந்தெடுக்கும்) ----------
+CAPTION_PROMPT = """You are a social media expert who writes viral Instagram Reels and YouTube Shorts captions for a Tamil audience.
+
+Steps:
+1. Decide the best mood for this content: funny, serious, emotional, motivational, or romantic. Use the user's context if given, otherwise pick the mood that gets the most engagement.
+2. Write a strong hook as the first line (max 8 words) that makes people stop scrolling.
+3. Write 1 or 2 short lines in Tamil-English mix (Tanglish) in that mood, with fitting emojis.
+4. End with a short call to action (like, share, follow, comment).
+5. Add 8 relevant hashtags: mix of trending and niche.
+
+Return ONLY valid JSON with keys: "mood", "title" (max 60 chars), "caption" (everything including hashtags)."""
+
+
 def make_caption(user_text=None):
     client = Groq(api_key=GROQ_API_KEY)
-    prompt = (
-        "Write a short, catchy Instagram reel caption in Tamil-English mix "
-        "with 5 trending hashtags. Max 3 lines."
-    )
+    prompt = CAPTION_PROMPT
     if user_text:
-        prompt += f" Photo context: {user_text}"
+        prompt += f"\n\nUser context for the photo: {user_text}"
     r = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
     )
-    return r.choices[0].message.content.strip()
+    text = r.choices[0].message.content.strip()
+    try:
+        s, e = text.index("{"), text.rindex("}") + 1
+        data = json.loads(text[s:e])
+        return (
+            data.get("mood", ""),
+            data.get("title", "New reel")[:100],
+            data.get("caption", text),
+        )
+    except Exception:
+        return ("", text.split("\n")[0][:100], text)
 
 
 # ---------- YouTube ----------
@@ -177,7 +218,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     await update.message.reply_text(
-        "Priyas Studio ரெடி.\nபோட்டோ அல்லது வீடியோ அனுப்புங்க (caption-ல title எழுதுங்க).\n"
+        "Priyas Studio ரெடி.\nஒரு போட்டோ அல்லது பல போட்டோ (slideshow) அல்லது வீடியோ அனுப்புங்க.\n"
+        "Caption-ல context எழுதினா AI அதுக்கேத்த மாதிரி எழுதும்.\n"
         "/yt on|off  /ig on|off  /status"
     )
 
@@ -187,7 +229,8 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"YouTube: {'ON' if state['yt'] else 'OFF'}\n"
-        f"Instagram: {'ON' if state['ig'] else 'OFF'}"
+        f"Instagram: {'ON' if state['ig'] else 'OFF'}\n"
+        f"Model: {GROQ_MODEL}"
     )
 
 
@@ -204,9 +247,7 @@ def make_toggle(key):
     return toggle
 
 
-async def publish(msg, path, caption):
-    title = caption.split("\n")[0]
-
+async def publish(msg, path, title, caption):
     if state["yt"]:
         await msg.reply_text("YouTube-ல ஏத்தறேன்...")
         try:
@@ -224,40 +265,69 @@ async def publish(msg, path, caption):
             await msg.reply_text(f"Instagram ❌ {e}")
 
 
-async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    msg = update.message
-    await msg.reply_text("போட்டோ கிடைச்சது, reel செய்யறேன்...")
-
-    tmp = tempfile.mkdtemp()
-    photo_path = os.path.join(tmp, "photo.jpg")
+async def build_and_post(msg, photo_paths, user_text, tmp):
     reel_path = os.path.join(tmp, "reel.mp4")
 
-    tg_file = await msg.photo[-1].get_file()
-    await tg_file.download_to_drive(photo_path)
-
     try:
-        caption = await asyncio.to_thread(make_caption, msg.caption)
+        mood, title, caption = await asyncio.to_thread(make_caption, user_text)
     except Exception as e:
         await msg.reply_text(f"Caption ❌ {e}")
-        caption = msg.caption or "New reel"
+        mood, title = "", (user_text or "New reel")[:60]
+        caption = user_text or "New reel"
 
     music = MUSIC_FILE if os.path.exists(MUSIC_FILE) else None
     try:
-        await asyncio.to_thread(make_reel, photo_path, reel_path, music)
+        await asyncio.to_thread(make_reel, photo_paths, reel_path, music)
     except Exception as e:
         await msg.reply_text(f"Reel ❌ {e}")
         return
 
-    await msg.reply_text(f"Caption:\n{caption}")
-    await publish(msg, reel_path, caption)
+    await msg.reply_text(f"Mood: {mood}\nTitle: {title}\n\n{caption}")
+    await publish(msg, reel_path, title, caption)
 
-    for p in (photo_path, reel_path):
+    for p in list(photo_paths) + [reel_path]:
         try:
             os.remove(p)
         except OSError:
             pass
+
+
+async def album_done(msg, group_id):
+    # சில வினாடி காத்திருந்து, album-ல எல்லா போட்டோவும் வந்ததும் reel செய்யும்
+    await asyncio.sleep(4)
+    data = albums.pop(group_id, None)
+    if not data:
+        return
+    await msg.reply_text(f"{len(data['paths'])} போட்டோ கிடைச்சது, slideshow reel செய்யறேன்...")
+    await build_and_post(msg, data["paths"], data["text"], data["tmp"])
+
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    msg = update.message
+    group_id = msg.media_group_id
+
+    if group_id:
+        data = albums.get(group_id)
+        if data is None:
+            data = {"paths": [], "text": msg.caption, "tmp": tempfile.mkdtemp()}
+            albums[group_id] = data
+            asyncio.create_task(album_done(msg, group_id))
+        if msg.caption and not data["text"]:
+            data["text"] = msg.caption
+        path = os.path.join(data["tmp"], f"p{len(data['paths'])}.jpg")
+        tg_file = await msg.photo[-1].get_file()
+        await tg_file.download_to_drive(path)
+        data["paths"].append(path)
+        return
+
+    await msg.reply_text("போட்டோ கிடைச்சது, reel செய்யறேன்...")
+    tmp = tempfile.mkdtemp()
+    photo_path = os.path.join(tmp, "photo.jpg")
+    tg_file = await msg.photo[-1].get_file()
+    await tg_file.download_to_drive(photo_path)
+    await build_and_post(msg, [photo_path], msg.caption, tmp)
 
 
 async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -268,14 +338,19 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not file_obj:
         return
 
-    caption = msg.caption or "New video"
     await msg.reply_text("வீடியோ எடுக்கறேன்...")
-
     tg_file = await file_obj.get_file()
     path = str(DOWNLOAD_DIR / f"{file_obj.file_unique_id}.mp4")
     await tg_file.download_to_drive(path)
 
-    await publish(msg, path, caption)
+    try:
+        mood, title, caption = await asyncio.to_thread(make_caption, msg.caption)
+    except Exception as e:
+        await msg.reply_text(f"Caption ❌ {e}")
+        title = (msg.caption or "New video").split("\n")[0][:100]
+        caption = msg.caption or "New video"
+
+    await publish(msg, path, title, caption)
 
     try:
         os.remove(path)
