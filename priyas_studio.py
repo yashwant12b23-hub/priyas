@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+import subprocess
+import imageio_ffmpeg
 from pathlib import Path
 
 from dotenv import load_dotenv
