@@ -19,7 +19,22 @@ from googleapiclient.http import MediaFileUpload
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
+class Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *args):
+        pass
+
+def start_web():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), Ping).serve_forever()
+
+threading.Thread(target=start_web, daemon=True).start()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
 IG_USERNAME = os.getenv("IG_USERNAME")
