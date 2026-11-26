@@ -6,239 +6,6 @@ import logging
 import subprocess
 import tempfile
 import traceback
-from datetime import datetime, time as dtime, date
-from pathlib import Path
-
-import requests
-import imageio_ffmpeg
-import edge_tts
-from dotenv import load_dotenv
-from groq import Groq
-from PIL import Image
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
-)
-from instagrapi import Client as IGClient
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-
-# ---------------- CONFIG ----------------
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
-IG_USERNAME = os.getenv("IG_USERNAME")
-IG_PASSWORD = os.getenv("IG_PASSWORD")
-
-IG_SESSION_FILE = "ig_session.json"
-YT_TOKEN_FILE = "yt_token.json"
-YT_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-MEMORY_FILE = "memory.json"
-MUSIC_DIR = Path("music")
-WATERMARK = os.getenv("WATERMARK", "Priyas Studio")
-POST_TIMES = [dtime(9, 0), dtime(18, 0)]  # two reels a day (server time)
-MAX_POSTS_PER_DAY = 2
-
-state = {
-    "yt": True,
-    "ig": True,
-    "auto": True,
-    "theme": os.getenv("THEME", "nature"),
-}
-
-THEMES = {
-    "nature": "nature landscape",
-    "travel": "travel destination",
-    "motivation": "sunrise mountain success",
-    "temple": "temple india",
-    "city": "city night",
-}
-
-FESTIVALS = {
-    (1, 14): "Pongal",
-    (1, 15): "Thiruvalluvar Day",
-    (4, 14): "Tamil New Year",
-    (8, 15): "Independence Day",
-    (10, 31): "Diwali",
-    (12, 25): "Christmas",
-    (1, 1): "New Year",
-}
-
-
-# ---------------- MEMORY (survives restarts) ----------------
-def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"used_photos": [], "posts": {}}
-
-
-def save_memory():
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(memory, f)
-
-
-memory = load_memory()
-
-
-def posts_today():
-    return memory["posts"].get(str(date.today()), 0)
-
-
-def count_post():
-    k = str(date.today())
-    memory["posts"][k] = memory["posts"].get(k, 0) + 1
-    save_memory()
-
-
-# ---------------- AI ----------------
-def ask_ai(prompt):
-    client = Groq(api_key=GROQ_API_KEY)
-    r = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return r.choices[0].message.content.strip()
-
-
-def parse_json(text):
-    s, e = text.index("{"), text.rindex("}") + 1
-    return json.loads(text[s:e])
-
-
-def make_content(theme_text, festival=None):
-    extra = f" Today is {festival}, make it about that." if festival else ""
-    prompt = (
-        "You write viral Instagram Reels and YouTube Shorts for a Tamil audience. "
-        f"Theme: {theme_text}.{extra} "
-        "Pick the best mood (funny, serious, emotional, motivational, romantic). "
-        "Write: a quote of max 15 words in Tamil script for on-screen text and voiceover; "
-        "a hook line of max 8 words; a caption in Tanglish with emojis and a call to action; "
-        "8 relevant hashtags. "
-        'Return ONLY valid JSON with keys: "mood", "title" (max 60 chars), '
-        '"quote", "caption" (including hashtags).'
-    )
-    text = ask_ai(prompt)
-    try:
-        d = parse_json(text)
-        return (
-            d.get("mood", ""),
-            d.get("title", "New reel")[:90],
-            d.get("quote", ""),
-            d.get("caption", text),
-        )
-    except Exception:
-        return ("", text.split("\n")[0][:90], "", text)
-
-
-# ---------------- PEXELS PHOTOS ----------------
-def fetch_photos(query, count, folder):
-    headers = {"Authorization": PEXELS_API_KEY}
-    page = random.randint(1, 10)
-    r = requests.get(
-        "https://api.pexels.com/v1/search",
-        headers=headers,
-        params={"query": query, "per_page": 40, "page": page, "orientation": "portrait"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    photos = r.json().get("photos", [])
-    random.shuffle(photos)
-    paths = []
-    for p in photos:
-        if len(paths) >= count:
-            break
-        pid = str(p["id"])
-        if pid in memory["used_photos"]:
-            continue
-        if p.get("width", 0) < 1000 or p.get("height", 0) < 1500:
-            continue  # skip low quality
-        url = p["src"]["large2x"]
-        path = os.path.join(folder, f"p{len(paths)}.jpg")
-        img = requests.get(url, timeout=30).content
-        with open(path, "wb") as f:
-            f.write(img)
-        try:
-            Image.open(path).verify()
-        except Exception:
-            continue
-        memory["used_photos"].append(pid)
-        paths.append(path)
-    memory["used_photos"] = memory["used_photos"][-500:]
-    save_memory()
-    return paths
-
-
-# ---------------- PEXELS VIDEOS ----------------
-def fetch_video(query, folder):
-    headers = {"Authorization": PEXELS_API_KEY}
-    r = requests.get(
-        "https://api.pexels.com/videos/search",
-        headers=headers,
-        params={"query": query, "per_page": 30, "page": random.randint(1, 5),
-                "orientation": "portrait"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    vids = r.json().get("videos", [])
-    random.shuffle(vids)
-    for v in vids:
-        vid = "v" + str(v["id"])
-        if vid in memory["used_photos"]:
-            continue
-        files = [f for f in v["video_files"] if f.get("file_type") == "video/mp4"
-                 and f.get("height", 0) >= 960]
-        if not files:
-            continue
-        files.sort(key=lambda f: f.get("height", 0))
-        url = files[0]["link"]
-        path = os.path.join(folder, "clip.mp4")
-        data = requests.get(url, timeout=60).content
-        with open(path, "wb") as f:
-            f.write(data)
-        memory["used_photos"].append(vid)
-        save_memory()
-        return path
-    return None
-
-
-# ---------------- MUSIC + VOICE ----------------
-def pick_music():
-    if MUSIC_DIR.exists():
-        files = list(MUSIC_DIR.glob("*.mp3"))
-        if files:
-            return str(random.choice(files))
-    return None
-
-
-async def make_voice(text, path):
-    if not text:
-        return None
-    try:
-        comm = edge_tts.Communicate(text, "ta-IN-PallaviNeural")
-        await comm.save(path)
-        return path
-    except Exception as e:
-        logging.warning("voice failed: %s", e)
-        return None
-        import os
-import json
-import random
-import asyncio
-import logging
-import subprocess
-import tempfile
-import traceback
 from datetime import time as dtime, date
 from pathlib import Path
 
@@ -257,6 +24,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -649,8 +417,13 @@ async def create_and_post(app):
         try:
             url = await asyncio.to_thread(upload_youtube, out, title, caption)
             results.append(f"YouTube OK {url}")
+        except HttpError as e:
+            if "uploadLimitExceeded" in str(e):
+                results.append("YouTube FAILED: daily upload limit reached, try tomorrow")
+            else:
+                results.append(f"YouTube FAILED {str(e)[:150]}")
         except Exception as e:
-            results.append(f"YouTube FAILED {e}")
+            results.append(f"YouTube FAILED {str(e)[:150]}")
     if state["ig"]:
         try:
             url = await asyncio.to_thread(upload_instagram, out, caption)
