@@ -1,8 +1,11 @@
 python-dotenv
-python-telegram-bot
+python-telegram-bot[job-queue]
 instagrapi==3.0.2
 google-auth
 google-auth-oauthlib
 google-api-python-client
 groq
 imageio-ffmpeg
+requests
+edge-tts
+Pillow
