@@ -114,8 +114,8 @@ def make_reel(photo_paths, output_path, music_path=None, sec_per_photo=3):
     filters_ = []
     for i in range(n):
         filters_.append(
-            f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
-            f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v{i}]"
+            f"[{i}:v]scale=540:960:force_original_aspect_ratio=decrease,"
+            f"pad=540:960:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,format=yuv420p[v{i}]"
         )
     concat_in = "".join(f"[v{i}]" for i in range(n))
     filters_.append(f"{concat_in}concat=n={n}:v=1:a=0[outv]")
