@@ -123,7 +123,7 @@ def make_reel(photo_paths, output_path, music_path=None, sec_per_photo=3):
     cmd += ["-filter_complex", ";".join(filters_), "-map", "[outv]"]
     if music_path:
         cmd += ["-map", f"{n}:a", "-c:a", "aac", "-shortest"]
-    cmd += ["-c:v", "libx264", "-t", str(total), "-movflags", "+faststart", output_path]
+    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-t", str(total), "-movflags", "+faststart", output_path]
     subprocess.run(cmd, check=True)
     return output_path
 
