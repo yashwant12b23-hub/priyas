@@ -1,9 +1,8 @@
 python-dotenv
 python-telegram-bot
-instagrapi[video]==3.0.2
+instagrapi==3.0.2
 google-auth
 google-auth-oauthlib
 google-api-python-client
 groq
 imageio-ffmpeg
-moviepy==2.2.1
