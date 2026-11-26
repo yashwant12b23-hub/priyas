@@ -231,50 +231,272 @@ async def make_voice(text, path):
     except Exception as e:
         logging.warning("voice failed: %s", e)
         return None
-        # ---------------- REEL MAKING ----------------
+        import os
+import json
+import random
+import asyncio
+import logging
+import subprocess
+import tempfile
+import traceback
+from datetime import time as dtime, date
+from pathlib import Path
+
+import requests
+import imageio_ffmpeg
+import edge_tts
+from dotenv import load_dotenv
+from groq import Groq
+from PIL import Image
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
+from instagrapi import Client as IGClient
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
+IG_USERNAME = os.getenv("IG_USERNAME")
+IG_PASSWORD = os.getenv("IG_PASSWORD")
+
+IG_SESSION_FILE = "ig_session.json"
+YT_TOKEN_FILE = "yt_token.json"
+YT_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+MEMORY_FILE = "memory.json"
+MUSIC_DIR = Path("music")
+POST_TIMES = [dtime(9, 0), dtime(18, 0)]  # two reels a day, server time
+MAX_POSTS_PER_DAY = 2
+
+state = {
+    "yt": True,
+    "ig": True,
+    "auto": True,
+    "theme": os.getenv("THEME", "nature"),
+}
+
+THEMES = {
+    "nature": "nature landscape",
+    "travel": "travel destination",
+    "motivation": "sunrise mountain success",
+    "temple": "temple india",
+    "city": "city night",
+}
+
+FESTIVALS = {
+    (1, 1): "New Year",
+    (1, 14): "Pongal",
+    (4, 14): "Tamil New Year",
+    (8, 15): "Independence Day",
+    (10, 31): "Diwali",
+    (12, 25): "Christmas",
+}
+
+
+# ---------------- MEMORY (survives restarts) ----------------
+def load_memory():
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"used": [], "posts": {}}
+
+
+def save_memory():
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(memory, f)
+
+
+memory = load_memory()
+
+
+def posts_today():
+    return memory["posts"].get(str(date.today()), 0)
+
+
+def count_post():
+    k = str(date.today())
+    memory["posts"][k] = memory["posts"].get(k, 0) + 1
+    save_memory()
+
+
+# ---------------- AI (English only) ----------------
+def ask_ai(prompt):
+    client = Groq(api_key=GROQ_API_KEY)
+    r = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return r.choices[0].message.content.strip()
+
+
+def make_content(theme_text, festival=None):
+    extra = f" Today is {festival}, make it about that." if festival else ""
+    prompt = (
+        "You write viral Instagram Reels and YouTube Shorts in English. "
+        f"Theme: {theme_text}.{extra} "
+        "Pick the best mood (funny, serious, emotional, motivational, romantic). "
+        "Write: a short inspiring quote of max 15 words, in English only, used for the voiceover; "
+        "a hook line of max 8 words; a caption in English with emojis and a call to action; "
+        "8 relevant hashtags. Everything must be in English. "
+        'Return ONLY valid JSON with keys: "mood", "title" (max 60 chars), '
+        '"quote", "caption" (including hashtags).'
+    )
+    text = ask_ai(prompt)
+    try:
+        s, e = text.index("{"), text.rindex("}") + 1
+        d = json.loads(text[s:e])
+        return (
+            d.get("mood", ""),
+            d.get("title", "New reel")[:90],
+            d.get("quote", ""),
+            d.get("caption", text),
+        )
+    except Exception:
+        return ("", text.split("\n")[0][:90], "", text)
+
+
+# ---------------- PEXELS PHOTOS ----------------
+def fetch_photos(query, count, folder):
+    headers = {"Authorization": PEXELS_API_KEY}
+    r = requests.get(
+        "https://api.pexels.com/v1/search",
+        headers=headers,
+        params={"query": query, "per_page": 40, "page": random.randint(1, 10),
+                "orientation": "portrait"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    photos = r.json().get("photos", [])
+    random.shuffle(photos)
+    paths = []
+    for p in photos:
+        if len(paths) >= count:
+            break
+        pid = "p" + str(p["id"])
+        if pid in memory["used"]:
+            continue
+        if p.get("width", 0) < 1000 or p.get("height", 0) < 1500:
+            continue  # skip low quality
+        path = os.path.join(folder, f"p{len(paths)}.jpg")
+        with open(path, "wb") as f:
+            f.write(requests.get(p["src"]["large2x"], timeout=30).content)
+        try:
+            Image.open(path).verify()
+        except Exception:
+            continue
+        memory["used"].append(pid)
+        paths.append(path)
+    memory["used"] = memory["used"][-500:]
+    save_memory()
+    return paths
+
+
+# ---------------- PEXELS VIDEOS ----------------
+def fetch_video(query, folder):
+    headers = {"Authorization": PEXELS_API_KEY}
+    r = requests.get(
+        "https://api.pexels.com/videos/search",
+        headers=headers,
+        params={"query": query, "per_page": 30, "page": random.randint(1, 5),
+                "orientation": "portrait"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    vids = r.json().get("videos", [])
+    random.shuffle(vids)
+    for v in vids:
+        vid = "v" + str(v["id"])
+        if vid in memory["used"]:
+            continue
+        files = [f for f in v["video_files"]
+                 if f.get("file_type") == "video/mp4" and f.get("height", 0) >= 960]
+        if not files:
+            continue
+        files.sort(key=lambda f: f.get("height", 0))
+        path = os.path.join(folder, "clip.mp4")
+        with open(path, "wb") as f:
+            f.write(requests.get(files[0]["link"], timeout=60).content)
+        memory["used"].append(vid)
+        save_memory()
+        return path
+    return None
+
+
+# ---------------- MUSIC + VOICE ----------------
+def pick_music():
+    if MUSIC_DIR.exists():
+        files = list(MUSIC_DIR.glob("*.mp3"))
+        if files:
+            return str(random.choice(files))
+    return None
+
+
+async def make_voice(text, path):
+    if not text:
+        return None
+    try:
+        await edge_tts.Communicate(text, "en-US-AriaNeural").save(path)
+        return path
+    except Exception as e:
+        logging.warning("voice failed: %s", e)
+        return None
+
+
+# ---------------- REEL MAKING ----------------
 def run_ffmpeg(cmd):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def font_file():
-    for p in [
-        "/usr/share/fonts/truetype/noto/NotoSansTamil-Bold.ttf",
-        "/usr/share/fonts/truetype/lohit-tamil/Lohit-Tamil.ttf",
-        "NotoSansTamil-Bold.ttf",
-    ]:
-        if os.path.exists(p):
-            return p
-    return None
+def audio_filter(music_idx, voice_idx):
+    """returns (extra filter text, map value) for the audio part"""
+    if music_idx is not None and voice_idx is not None:
+        return (f"[{music_idx}:a]volume=0.25[ma];[{voice_idx}:a]volume=1.4[va];"
+                f"[ma][va]amix=inputs=2:duration=longest[aud]"), "[aud]"
+    if music_idx is not None:
+        return None, f"{music_idx}:a"
+    if voice_idx is not None:
+        return None, f"{voice_idx}:a"
+    return None, None
 
 
-def make_photo_reel(photo_paths, out, music=None, voice=None, quote=""):
+def make_photo_reel(photo_paths, out, music=None, voice=None):
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     n = len(photo_paths)
     sec = 5
-    total = n * sec
-    styles = ["zoomin", "zoomout", "pan"]
+    frames = sec * 24
 
     cmd = [ff, "-y"]
     for p in photo_paths:
         cmd += ["-loop", "1", "-t", str(sec), "-i", p]
-    next_in = n
+    idx = n
     music_idx = voice_idx = None
     if music:
         cmd += ["-stream_loop", "-1", "-i", music]
-        music_idx = next_in
-        next_in += 1
+        music_idx = idx
+        idx += 1
     if voice:
         cmd += ["-i", voice]
-        voice_idx = next_in
-        next_in += 1
+        voice_idx = idx
 
-    frames = sec * 24
     fl = []
     for i in range(n):
-        st = random.choice(styles)
-        if st == "zoomin":
+        style = random.choice(["in", "out", "pan"])
+        if style == "in":
             z = f"zoompan=z='min(zoom+0.0015,1.3)':d={frames}:s=540x960:fps=24"
-        elif st == "zoomout":
+        elif style == "out":
             z = f"zoompan=z='if(eq(on,1),1.3,max(zoom-0.0015,1.0))':d={frames}:s=540x960:fps=24"
         else:
             z = f"zoompan=z=1.2:x='(iw-iw/zoom)*on/{frames}':d={frames}:s=540x960:fps=24"
@@ -282,47 +504,21 @@ def make_photo_reel(photo_paths, out, music=None, voice=None, quote=""):
             f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=increase,"
             f"crop=1080:1920,{z},setsar=1,format=yuv420p[v{i}]"
         )
-    concat_in = "".join(f"[v{i}]" for i in range(n))
-    fl.append(f"{concat_in}concat=n={n}:v=1:a=0[cat]")
+    fl.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[outv]")
+    extra, amap = audio_filter(music_idx, voice_idx)
+    if extra:
+        fl.append(extra)
 
-    last = "cat"
-    font = font_file()
-    if font:
-        qfile = out + ".quote.txt"
-        with open(qfile, "w", encoding="utf-8") as f:
-            f.write(quote or "")
-        fl.append(
-            f"[{last}]drawtext=fontfile='{font}':textfile='{qfile}':fontcolor=white:"
-            f"fontsize=34:x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=black@0.45:boxborderw=14[q]"
-        )
-        last = "q"
-        fl.append(
-            f"[{last}]drawtext=fontfile='{font}':text='{WATERMARK}':fontcolor=white@0.7:"
-            f"fontsize=22:x=w-text_w-20:y=h-text_h-30[wm]"
-        )
-        last = "wm"
-
-    # audio
-    audio_map = None
-    if music_idx is not None and voice_idx is not None:
-        fl.append(f"[{music_idx}:a]volume=0.25[ma];[{voice_idx}:a]volume=1.4[va];"
-                  f"[ma][va]amix=inputs=2:duration=longest[aud]")
-        audio_map = "[aud]"
-    elif music_idx is not None:
-        audio_map = f"{music_idx}:a"
-    elif voice_idx is not None:
-        audio_map = f"{voice_idx}:a"
-
-    cmd += ["-filter_complex", ";".join(fl), "-map", f"[{last}]"]
-    if audio_map:
-        cmd += ["-map", audio_map, "-c:a", "aac"]
+    cmd += ["-filter_complex", ";".join(fl), "-map", "[outv]"]
+    if amap:
+        cmd += ["-map", amap, "-c:a", "aac"]
     cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-threads", "1",
-            "-t", str(total), "-movflags", "+faststart", out]
+            "-t", str(n * sec), "-movflags", "+faststart", out]
     run_ffmpeg(cmd)
     return out
 
 
-def make_video_reel(clip, out, music=None, voice=None, quote=""):
+def make_video_reel(clip, out, music=None, voice=None):
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [ff, "-y", "-i", clip]
     idx = 1
@@ -334,36 +530,16 @@ def make_video_reel(clip, out, music=None, voice=None, quote=""):
     if voice:
         cmd += ["-i", voice]
         voice_idx = idx
-        idx += 1
+
     fl = ["[0:v]scale=540:960:force_original_aspect_ratio=increase,crop=540:960,"
-          "setsar=1,fps=24,format=yuv420p[v]"]
-    last = "v"
-    font = font_file()
-    if font:
-        qfile = out + ".quote.txt"
-        with open(qfile, "w", encoding="utf-8") as f:
-            f.write(quote or "")
-        fl.append(
-            f"[{last}]drawtext=fontfile='{font}':textfile='{qfile}':fontcolor=white:"
-            f"fontsize=34:x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=black@0.45:boxborderw=14[q]"
-        )
-        fl.append(
-            f"[q]drawtext=fontfile='{font}':text='{WATERMARK}':fontcolor=white@0.7:"
-            f"fontsize=22:x=w-text_w-20:y=h-text_h-30[wm]"
-        )
-        last = "wm"
-    audio_map = None
-    if music_idx is not None and voice_idx is not None:
-        fl.append(f"[{music_idx}:a]volume=0.25[ma];[{voice_idx}:a]volume=1.4[va];"
-                  f"[ma][va]amix=inputs=2:duration=longest[aud]")
-        audio_map = "[aud]"
-    elif music_idx is not None:
-        audio_map = f"{music_idx}:a"
-    elif voice_idx is not None:
-        audio_map = f"{voice_idx}:a"
-    cmd += ["-filter_complex", ";".join(fl), "-map", f"[{last}]"]
-    if audio_map:
-        cmd += ["-map", audio_map, "-c:a", "aac"]
+          "setsar=1,fps=24,format=yuv420p[outv]"]
+    extra, amap = audio_filter(music_idx, voice_idx)
+    if extra:
+        fl.append(extra)
+
+    cmd += ["-filter_complex", ";".join(fl), "-map", "[outv]"]
+    if amap:
+        cmd += ["-map", amap, "-c:a", "aac"]
     cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-threads", "1",
             "-t", "20", "-movflags", "+faststart", out]
     run_ffmpeg(cmd)
@@ -373,7 +549,7 @@ def make_video_reel(clip, out, music=None, voice=None, quote=""):
 # ---------------- YOUTUBE ----------------
 def yt_service():
     if not os.path.exists(YT_TOKEN_FILE):
-        raise RuntimeError("yt_token.json missing. Login once on your computer and upload it.")
+        raise RuntimeError("yt_token.json missing. Log in once on your computer and upload it.")
     creds = Credentials.from_authorized_user_file(YT_TOKEN_FILE, YT_SCOPES)
     if not creds.valid:
         if creds.expired and creds.refresh_token:
@@ -381,7 +557,7 @@ def yt_service():
             with open(YT_TOKEN_FILE, "w") as f:
                 f.write(creds.to_json())
         else:
-            raise RuntimeError("YouTube token invalid. Login again on your computer.")
+            raise RuntimeError("YouTube token invalid. Log in again on your computer.")
     return build("youtube", "v3", credentials=creds)
 
 
@@ -405,7 +581,7 @@ def ig_client():
     if os.path.exists(IG_SESSION_FILE):
         cl.load_settings(IG_SESSION_FILE)
         try:
-            cl.get_timeline_feed()  # session still valid, no fresh login
+            cl.get_timeline_feed()  # session still valid, skip fresh login
             return cl
         except Exception:
             pass
@@ -426,19 +602,18 @@ def upload_instagram(path, caption):
 # ---------------- ONE FULL RUN ----------------
 async def notify(app, text):
     try:
-        await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=text)
+        await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=text[:4000])
     except Exception as e:
         logging.warning("notify failed: %s", e)
 
 
 async def create_and_post(app):
     if posts_today() >= MAX_POSTS_PER_DAY:
-        await notify(app, "Innaikku 2 post mudinchu, innum podala.")
+        await notify(app, "Already posted 2 reels today. Skipping.")
         return
 
     tmp = tempfile.mkdtemp()
-    theme_key = state["theme"]
-    query = THEMES.get(theme_key, theme_key)
+    query = THEMES.get(state["theme"], state["theme"])
     festival = FESTIVALS.get((date.today().month, date.today().day))
     if festival:
         query = festival + " celebration"
@@ -446,30 +621,27 @@ async def create_and_post(app):
     try:
         mood, title, quote, caption = await asyncio.to_thread(make_content, query, festival)
     except Exception as e:
-        await notify(app, f"AI content fail: {e}")
+        await notify(app, f"AI content failed: {e}")
         return
 
     music = pick_music()
     voice = await make_voice(quote, os.path.join(tmp, "voice.mp3"))
     out = os.path.join(tmp, "reel.mp4")
 
-    # alternate: photo slideshow or stock video clip
-    use_video = random.random() < 0.5
     made = False
     try:
-        if use_video:
+        if random.random() < 0.5:  # half the time use a stock video clip
             clip = await asyncio.to_thread(fetch_video, query, tmp)
             if clip:
-                await asyncio.to_thread(make_video_reel, clip, out, music, voice, quote)
+                await asyncio.to_thread(make_video_reel, clip, out, music, voice)
                 made = True
         if not made:
             photos = await asyncio.to_thread(fetch_photos, query, 3, tmp)
             if len(photos) < 3:
-                raise RuntimeError("Pothumana nalla photos kidaikkala")
-            await asyncio.to_thread(make_photo_reel, photos, out, music, voice, quote)
-            made = True
+                raise RuntimeError("Not enough good photos found")
+            await asyncio.to_thread(make_photo_reel, photos, out, music, voice)
     except Exception as e:
-        await notify(app, f"Reel fail: {e}\n{traceback.format_exc()[-300:]}")
+        await notify(app, f"Reel failed: {e}\n{traceback.format_exc()[-300:]}")
         return
 
     results = []
@@ -478,15 +650,15 @@ async def create_and_post(app):
             url = await asyncio.to_thread(upload_youtube, out, title, caption)
             results.append(f"YouTube OK {url}")
         except Exception as e:
-            results.append(f"YouTube FAIL {e}")
+            results.append(f"YouTube FAILED {e}")
     if state["ig"]:
         try:
             url = await asyncio.to_thread(upload_instagram, out, caption)
             results.append(f"Instagram OK {url}")
         except Exception as e:
-            results.append(f"Instagram FAIL {e}")
+            results.append(f"Instagram FAILED {e}")
 
-    if any("OK" in r for r in results):
+    if any(" OK " in r for r in results):
         count_post()
     await notify(app, f"Mood: {mood}\nTitle: {title}\nQuote: {quote}\n\n" + "\n".join(results))
 
@@ -506,13 +678,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     await update.message.reply_text(
-        "Priyas Studio ready.\n"
-        "/now - ippo oru reel podu\n"
+        "Priyas Studio is ready.\n"
+        "/now - make and post a reel right now\n"
         "/theme nature|travel|motivation|temple|city\n"
-        "/auto on|off - thaana podurathu\n"
+        "/auto on|off - automatic posting\n"
         "/yt on|off  /ig on|off\n"
         "/status\n"
-        "Ethavathu text anuppina AI pathil solum."
+        "Send any text and the AI will reply."
     )
 
 
@@ -524,7 +696,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Instagram: {'ON' if state['ig'] else 'OFF'}\n"
         f"Auto: {'ON' if state['auto'] else 'OFF'}\n"
         f"Theme: {state['theme']}\n"
-        f"Innaikku posts: {posts_today()}/{MAX_POSTS_PER_DAY}\n"
+        f"Posts today: {posts_today()}/{MAX_POSTS_PER_DAY}\n"
         f"Model: {GROQ_MODEL}"
     )
 
@@ -535,10 +707,10 @@ def make_toggle(key):
             return
         arg = ctx.args[0].lower() if ctx.args else ""
         if arg not in ("on", "off"):
-            await update.message.reply_text(f"/{key} on allathu /{key} off")
+            await update.message.reply_text(f"Use /{key} on or /{key} off")
             return
         state[key] = arg == "on"
-        await update.message.reply_text(f"{key.upper()} -> {'ON' if state[key] else 'OFF'}")
+        await update.message.reply_text(f"{key.upper()} is now {'ON' if state[key] else 'OFF'}")
     return toggle
 
 
@@ -550,25 +722,24 @@ async def cmd_theme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Themes: " + ", ".join(THEMES))
         return
     state["theme"] = arg
-    await update.message.reply_text(f"Theme -> {arg}")
+    await update.message.reply_text(f"Theme set to {arg}")
 
 
 async def cmd_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    await update.message.reply_text("Reel seiyaren, konjam neram aagum...")
+    await update.message.reply_text("Creating a reel, this takes a few minutes...")
     asyncio.create_task(create_and_post(ctx.application))
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    text = update.message.text
     try:
         reply = await asyncio.to_thread(
             ask_ai,
-            "You are the assistant of a Tamil social media creator. "
-            "Reply briefly in the same language style as the user.\n\nUser: " + text,
+            "You are the assistant of a social media creator. Reply briefly in English.\n\nUser: "
+            + update.message.text,
         )
     except Exception as e:
         reply = f"AI error: {e}"
