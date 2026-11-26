@@ -205,9 +205,14 @@ def ig_client():
 
 def upload_instagram(path, caption):
     cl = ig_client()
-    media = cl.clip_upload(Path(path), caption)
+    thumb = str(Path(path).with_suffix(".jpg"))
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run(
+        [ffmpeg, "-y", "-ss", "1", "-i", path, "-vframes", "1", thumb],
+        check=True,
+    )
+    media = cl.clip_upload(Path(path), caption, thumbnail=Path(thumb))
     return f"https://www.instagram.com/reel/{media.code}/"
-
 
 # ---------- Telegram ----------
 def is_owner(update):
