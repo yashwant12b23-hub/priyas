@@ -104,7 +104,7 @@ def count_post():
 
 # ---------------- AI & 6-AGENT PIPELINE ----------------
 def ask_ai(prompt, system_prompt=None):
-    # Anthropic API key இருந்தால் Claude பயன்படுத்தும், இல்லையென்றால் Groq பயன்படுத்தும்
+    # Use Claude if Anthropic API key is configured, otherwise fall back to Groq
     if HAS_ANTHROPIC and ANTHROPIC_API_KEY:
         aclient = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         kwargs = {
@@ -226,7 +226,7 @@ def fetch_photos(query, count, folder):
     memory["used"] = memory["used"][-500:]
     save_memory()
     return paths
-
+            
 def fetch_video(query, folder):
     headers = {"Authorization": PEXELS_API_KEY}
     r = requests.get(
@@ -387,7 +387,13 @@ async def video_editing_agent(pkg, query, tmp):
             await asyncio.to_thread(make_video_reel, clip, out, music, voice)
             made = True
     if not made:
-        # ---------------- YOUTUBE & INSTAGRAM (Agent 6: Auto Upload Agent) ----------------
+        photos = await asyncio.to_thread(fetch_photos, media_query, 3, tmp)
+        if len(photos) < 3:
+            raise RuntimeError("Not enough good photos found")
+        await asyncio.to_thread(make_photo_reel, photos, out, music, voice)
+    return out
+
+# ---------------- YOUTUBE & INSTAGRAM (Agent 6: Auto Upload Agent) ----------------
 def yt_service():
     if not os.path.exists(YT_TOKEN_FILE):
         raise RuntimeError("yt_token.json missing.")
@@ -603,4 +609,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+
+
