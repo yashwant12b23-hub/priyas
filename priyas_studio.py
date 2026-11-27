@@ -26,6 +26,12 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
+try:
+    import anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
@@ -34,6 +40,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 IG_USERNAME = os.getenv("IG_USERNAME")
 IG_PASSWORD = os.getenv("IG_PASSWORD")
@@ -94,48 +102,104 @@ def count_post():
     memory["posts"][k] = memory["posts"].get(k, 0) + 1
     save_memory()
 
-# ---------------- AI ----------------
-def ask_ai(prompt):
+# ---------------- AI & 6-AGENT PIPELINE ----------------
+def ask_ai(prompt, system_prompt=None):
+    # Anthropic API key இருந்தால் Claude பயன்படுத்தும், இல்லையென்றால் Groq பயன்படுத்தும்
+    if HAS_ANTHROPIC and ANTHROPIC_API_KEY:
+        aclient = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        kwargs = {
+            "model": CLAUDE_MODEL,
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system_prompt:
+            kwargs["system"] = system_prompt
+        resp = aclient.messages.create(**kwargs)
+        return resp.content[0].text.strip()
+
     client = Groq(api_key=GROQ_API_KEY)
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
     r = client.chat.completions.create(
         model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
+        messages=messages,
     )
     return r.choices[0].message.content.strip()
 
-def make_content(theme_text, festival=None):
-    extra = f" Today is {festival}, make it about that." if festival else ""
-    prompt = (
-        "You write viral Instagram Reels and YouTube Shorts in English. "
-        f"Theme: {theme_text}.{extra} "
-        "Pick the best mood (funny, serious, emotional, motivational, romantic). "
-        "Write: a short inspiring quote of max 15 words, in English only, used for the voiceover; "
-        "a hook line of max 8 words; a caption in English with emojis and a call to action; "
-        "8 relevant hashtags. Everything must be in English. "
-        'Return ONLY valid JSON with keys: "mood", "title" (max 60 chars), '
-        '"quote", "caption" (including hashtags).'
+def run_agent(role, system_prompt, user_input):
+    logging.info("[%s] running...", role)
+    return ask_ai(user_input, system_prompt=f"You are a {role}. {system_prompt}")
+
+# Agent 1: Researcher Agent
+def researcher_agent(theme_text, festival=None):
+    extra = f" Today is {festival}, incorporate it." if festival else ""
+    return run_agent(
+        "Researcher Agent",
+        "Identify trending topics, viral hooks, and audience pain points for short-form Reels/Shorts in English.",
+        f"Theme: {theme_text}.{extra}",
     )
-    text = ask_ai(prompt)
+
+# Agent 2: Competitor Analysis Agent
+def competitor_analysis_agent(research_notes):
+    return run_agent(
+        "Competitor Analysis Agent",
+        "Analyze competitor short-form content patterns and define a high-retention structure, best mood (funny, serious, emotional, motivational, romantic), and visual direction.",
+        research_notes,
+    )
+
+# Agent 3: Video Generator Agent (Content & Script Blueprint)
+def video_generator_agent(strategy):
+    prompt = (
+        "Based on this strategy, create a viral Instagram Reel / YouTube Short package in English. "
+        "Write: a short inspiring quote of max 15 words for voiceover; "
+        "a hook/title of max 60 chars; a caption with emojis, call to action, and 8 relevant hashtags. "
+        'Return ONLY valid JSON with keys: "mood", "title", "quote", "caption", "search_query".'
+    )
+    text = run_agent("Video Generator Agent", prompt, strategy)
     try:
         s, e = text.index("{"), text.rindex("}") + 1
         d = json.loads(text[s:e])
-        return (
-            d.get("mood", ""),
-            d.get("title", "New reel")[:90],
-            d.get("quote", ""),
-            d.get("caption", text),
-        )
+        return {
+            "mood": d.get("mood", "motivational"),
+            "title": str(d.get("title", "New Reel"))[:90],
+            "quote": d.get("quote", ""),
+            "caption": d.get("caption", text),
+            "search_query": d.get("search_query", ""),
+        }
     except Exception:
-        return ("", text.split("\n")[0][:90], "", text)
+        return {
+            "mood": "motivational",
+            "title": text.split("\n")[0][:90],
+            "quote": "",
+            "caption": text,
+            "search_query": "",
+        }
 
-# ---------------- PEXELS PHOTOS ----------------
+# Agent 5: Approval Agent
+def approval_agent(content_pkg):
+    if not content_pkg.get("title") or not content_pkg.get("caption"):
+        return False
+    verdict = run_agent(
+        "Approval Agent",
+        "Check if the short-form reel script, quote, and caption are safe, clear, and engaging. Reply ONLY with APPROVED or REJECTED.",
+        json.dumps(content_pkg),
+    )
+    return "REJECTED" not in verdict.upper()
+
+# ---------------- PEXELS MEDIA ----------------
 def fetch_photos(query, count, folder):
     headers = {"Authorization": PEXELS_API_KEY}
     r = requests.get(
         "https://api.pexels.com/v1/search",
         headers=headers,
-        params={"query": query, "per_page": 40, "page": random.randint(1, 10),
-                "orientation": "portrait"},
+        params={
+            "query": query,
+            "per_page": 40,
+            "page": random.randint(1, 10),
+            "orientation": "portrait",
+        },
         timeout=20,
     )
     r.raise_for_status()
@@ -163,14 +227,17 @@ def fetch_photos(query, count, folder):
     save_memory()
     return paths
 
-# ---------------- PEXELS VIDEOS ----------------
 def fetch_video(query, folder):
     headers = {"Authorization": PEXELS_API_KEY}
     r = requests.get(
         "https://api.pexels.com/videos/search",
         headers=headers,
-        params={"query": query, "per_page": 30, "page": random.randint(1, 5),
-                "orientation": "portrait"},
+        params={
+            "query": query,
+            "per_page": 30,
+            "page": random.randint(1, 5),
+            "orientation": "portrait",
+        },
         timeout=20,
     )
     r.raise_for_status()
@@ -180,8 +247,10 @@ def fetch_video(query, folder):
         vid = "v" + str(v["id"])
         if vid in memory["used"]:
             continue
-        files = [f for f in v["video_files"]
-                 if f.get("file_type") == "video/mp4" and f.get("height", 0) >= 960]
+        files = [
+            f for f in v["video_files"]
+            if f.get("file_type") == "video/mp4" and f.get("height", 0) >= 960
+        ]
         if not files:
             continue
         files.sort(key=lambda f: f.get("height", 0))
@@ -211,14 +280,16 @@ async def make_voice(text, path):
         logging.warning("voice failed: %s", e)
         return None
 
-# ---------------- REEL MAKING ----------------
+# ---------------- REEL MAKING (Agent 4: Video Editing Agent) ----------------
 def run_ffmpeg(cmd):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def audio_filter(music_idx, voice_idx):
     if music_idx is not None and voice_idx is not None:
-        return (f"[{music_idx}:a]volume=0.25[ma];[{voice_idx}:a]volume=1.4[va];"
-                f"[ma][va]amix=inputs=2:duration=longest[aud]"), "[aud]"
+        return (
+            f"[{music_idx}:a]volume=0.25[ma];[{voice_idx}:a]volume=1.4[va];"
+            f"[ma][va]amix=inputs=2:duration=longest[aud]"
+        ), "[aud]"
     if music_idx is not None:
         return None, f"{music_idx}:a"
     if voice_idx is not None:
@@ -265,8 +336,10 @@ def make_photo_reel(photo_paths, out, music=None, voice=None):
     cmd += ["-filter_complex", ";".join(fl), "-map", "[outv]"]
     if amap:
         cmd += ["-map", amap, "-c:a", "aac"]
-    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-threads", "1",
-            "-t", str(n * sec), "-movflags", "+faststart", out]
+    cmd += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-threads", "1",
+        "-t", str(n * sec), "-movflags", "+faststart", out,
+    ]
     run_ffmpeg(cmd)
     return out
 
@@ -283,8 +356,10 @@ def make_video_reel(clip, out, music=None, voice=None):
         cmd += ["-i", voice]
         voice_idx = idx
 
-    fl = ["[0:v]scale=540:960:force_original_aspect_ratio=increase,crop=540:960,"
-          "setsar=1,fps=24,format=yuv420p[outv]"]
+    fl = [
+        "[0:v]scale=540:960:force_original_aspect_ratio=increase,crop=540:960,"
+        "setsar=1,fps=24,format=yuv420p[outv]"
+    ]
     extra, amap = audio_filter(music_idx, voice_idx)
     if extra:
         fl.append(extra)
@@ -292,12 +367,27 @@ def make_video_reel(clip, out, music=None, voice=None):
     cmd += ["-filter_complex", ";".join(fl), "-map", "[outv]"]
     if amap:
         cmd += ["-map", amap, "-c:a", "aac"]
-    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-threads", "1",
-            "-t", "20", "-movflags", "+faststart", out]
+    cmd += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-threads", "1",
+        "-t", "20", "-movflags", "+faststart", out,
+    ]
     run_ffmpeg(cmd)
     return out
 
-# ---------------- YOUTUBE ----------------
+async def video_editing_agent(pkg, query, tmp):
+    music = pick_music()
+    voice = await make_voice(pkg["quote"], os.path.join(tmp, "voice.mp3"))
+    out = os.path.join(tmp, "reel.mp4")
+    media_query = pkg.get("search_query") or query
+
+    made = False
+    if random.random() < 0.5:
+        clip = await asyncio.to_thread(fetch_video, media_query, tmp)
+        if clip:
+            await asyncio.to_thread(make_video_reel, clip, out, music, voice)
+            made = True
+    if not made:
+        # ---------------- YOUTUBE & INSTAGRAM (Agent 6: Auto Upload Agent) ----------------
 def yt_service():
     if not os.path.exists(YT_TOKEN_FILE):
         raise RuntimeError("yt_token.json missing.")
@@ -324,7 +414,6 @@ def upload_youtube(path, title, description):
         _, resp = req.next_chunk()
     return f"https://youtu.be/{resp['id']}"
 
-# ---------------- INSTAGRAM ----------------
 def ig_client():
     cl = IGClient()
     if os.path.exists(IG_SESSION_FILE):
@@ -346,6 +435,27 @@ def upload_instagram(path, caption):
     media = cl.clip_upload(Path(path), caption, thumbnail=Path(thumb))
     return f"https://www.instagram.com/reel/{media.code}/"
 
+async def auto_upload_agent(out, title, caption):
+    results = []
+    if state["yt"]:
+        try:
+            url = await asyncio.to_thread(upload_youtube, out, title, caption)
+            results.append(f"YouTube OK {url}")
+        except HttpError as e:
+            if "uploadLimitExceeded" in str(e):
+                results.append("YouTube FAILED: daily upload limit reached")
+            else:
+                results.append(f"YouTube FAILED {str(e)[:150]}")
+        except Exception as e:
+            results.append(f"YouTube FAILED {str(e)[:150]}")
+    if state["ig"]:
+        try:
+            url = await asyncio.to_thread(upload_instagram, out, caption)
+            results.append(f"Instagram OK {url}")
+        except Exception as e:
+            results.append(f"Instagram FAILED {e}")
+    return results
+
 # ---------------- ONE FULL RUN ----------------
 async def notify(app, text):
     try:
@@ -365,53 +475,33 @@ async def create_and_post(app):
         query = festival + " celebration"
 
     try:
-        mood, title, quote, caption = await asyncio.to_thread(make_content, query, festival)
+        research = await asyncio.to_thread(researcher_agent, query, festival)
+        strategy = await asyncio.to_thread(competitor_analysis_agent, research)
+        pkg = await asyncio.to_thread(video_generator_agent, strategy)
     except Exception as e:
-        await notify(app, f"AI content failed: {e}")
+        await notify(app, f"AI agents failed: {e}")
         return
 
-    music = pick_music()
-    voice = await make_voice(quote, os.path.join(tmp, "voice.mp3"))
-    out = os.path.join(tmp, "reel.mp4")
+    approved = await asyncio.to_thread(approval_agent, pkg)
+    if not approved:
+        await notify(app, "Approval Agent rejected the generated content.")
+        return
 
-    made = False
     try:
-        if random.random() < 0.5:
-            clip = await asyncio.to_thread(fetch_video, query, tmp)
-            if clip:
-                await asyncio.to_thread(make_video_reel, clip, out, music, voice)
-                made = True
-        if not made:
-            photos = await asyncio.to_thread(fetch_photos, query, 3, tmp)
-            if len(photos) < 3:
-                raise RuntimeError("Not enough good photos found")
-            await asyncio.to_thread(make_photo_reel, photos, out, music, voice)
+        out = await video_editing_agent(pkg, query, tmp)
     except Exception as e:
         await notify(app, f"Reel failed: {e}\n{traceback.format_exc()[-300:]}")
         return
 
-    results = []
-    if state["yt"]:
-        try:
-            url = await asyncio.to_thread(upload_youtube, out, title, caption)
-            results.append(f"YouTube OK {url}")
-        except HttpError as e:
-            if "uploadLimitExceeded" in str(e):
-                results.append("YouTube FAILED: daily upload limit reached")
-            else:
-                results.append(f"YouTube FAILED {str(e)[:150]}")
-        except Exception as e:
-            results.append(f"YouTube FAILED {str(e)[:150]}")
-    if state["ig"]:
-        try:
-            url = await asyncio.to_thread(upload_instagram, out, caption)
-            results.append(f"Instagram OK {url}")
-        except Exception as e:
-            results.append(f"Instagram FAILED {e}")
+    results = await auto_upload_agent(out, pkg["title"], pkg["caption"])
 
     if any(" OK " in r for r in results):
         count_post()
-    await notify(app, f"Mood: {mood}\nTitle: {title}\nQuote: {quote}\n\n" + "\n".join(results))
+    await notify(
+        app,
+        f"Mood: {pkg['mood']}\nTitle: {pkg['title']}\nQuote: {pkg['quote']}\n\n"
+        + "\n".join(results),
+    )
 
     for f in Path(tmp).glob("*"):
         try:
@@ -427,7 +517,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     await update.message.reply_text(
-        "Priyas Studio is ready.\n"
+        "Priyas Studio (6-Agent Pipeline) is ready.\n"
         "/now - make and post a reel right now\n"
         "/theme nature|travel|motivation|temple|city\n"
         "/auto on|off - automatic posting\n"
@@ -445,7 +535,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Auto: {'ON' if state['auto'] else 'OFF'}\n"
         f"Theme: {state['theme']}\n"
         f"Posts today: {posts_today()}/{MAX_POSTS_PER_DAY}\n"
-        f"Model: {GROQ_MODEL}"
+        f"Model: {CLAUDE_MODEL if (HAS_ANTHROPIC and ANTHROPIC_API_KEY) else GROQ_MODEL}"
     )
 
 def make_toggle(key):
@@ -473,7 +563,7 @@ async def cmd_theme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    await update.message.reply_text("Creating a reel, this takes a few minutes...")
+    await update.message.reply_text("Creating a reel via 6 agents, this takes a few minutes...")
     asyncio.create_task(create_and_post(ctx.application))
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -482,8 +572,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         reply = await asyncio.to_thread(
             ask_ai,
-            "You are the assistant of a social media creator. Reply briefly in English.\n\nUser: "
-            + update.message.text,
+            update.message.text,
+            "You are the assistant of a social media creator. Reply briefly in English.",
         )
     except Exception as e:
         reply = f"AI error: {e}"
