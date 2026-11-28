@@ -1240,7 +1240,7 @@ async def on_startup(app):
     if SU:
         ok, bad = SU.load_upgrades()
         extra = f" | upgrades loaded: {len(ok)}" + (f", skipped broken: {len(bad)}" if bad else "")
-    await notify(app, f"Bot started \u2705 (version: {VERSION}){extra}")
+    await notify(app, f"Bot started ")
 
 
 def main():
