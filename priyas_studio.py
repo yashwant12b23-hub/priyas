@@ -313,14 +313,15 @@ def approval_agent(pkg):
 
 # ======================= PEXELS MEDIA =======================
 def fetch_photos(query, count, folder):
-    headers = {"Authorization": PEXELS_API_KEY}
     r = requests.get(
-        "https://api.pexels.com/v1/search", headers=headers,
-        params={"query": query, "per_page": 40, "page": random.randint(1, 10), "orientation": "portrait"},
+        "https://pixabay.com/api/",
+        params={"key": PEXELS_API_KEY, "q": query, "image_type": "photo",
+                "orientation": "vertical", "per_page": 100,
+                "page": random.randint(1, 3), "safesearch": "true"},
         timeout=20,
     )
     r.raise_for_status()
-    photos = r.json().get("photos", [])
+    photos = r.json().get("hits", [])
     random.shuffle(photos)
     paths = []
     for p in photos:
@@ -329,11 +330,11 @@ def fetch_photos(query, count, folder):
         pid = "p" + str(p["id"])
         if pid in memory["used"]:
             continue
-        if p.get("width", 0) < 1000 or p.get("height", 0) < 1500:
+        if p.get("imageWidth", 0) < 1000 or p.get("imageHeight", 0) < 1500:
             continue
         path = os.path.join(folder, f"p{len(paths)}.jpg")
         with open(path, "wb") as f:
-            f.write(requests.get(p["src"]["large2x"], timeout=30).content)
+            f.write(requests.get(p["largeImageURL"], timeout=30).content)
         try:
             Image.open(path).verify()
         except Exception:
@@ -344,29 +345,29 @@ def fetch_photos(query, count, folder):
     save_memory()
     return paths
 
-
 def fetch_video(query, folder):
-    headers = {"Authorization": PEXELS_API_KEY}
     r = requests.get(
-        "https://api.pexels.com/videos/search", headers=headers,
-        params={"query": query, "per_page": 30, "page": random.randint(1, 5), "orientation": "portrait"},
+        "https://pixabay.com/api/videos/",
+        params={"key": PEXELS_API_KEY, "q": query, "per_page": 50,
+                "page": random.randint(1, 2), "safesearch": "true"},
         timeout=20,
     )
     r.raise_for_status()
-    vids = r.json().get("videos", [])
+    vids = r.json().get("hits", [])
     random.shuffle(vids)
     for v in vids:
         vid = "v" + str(v["id"])
         if vid in memory["used"]:
             continue
-        files = [f for f in v["video_files"]
-                 if f.get("file_type") == "video/mp4" and f.get("height", 0) >= 960]
+        files = [f for f in v.get("videos", {}).values()
+                 if f.get("url") and f.get("height", 0) >= 960
+                 and f.get("height", 0) > f.get("width", 0)]
         if not files:
             continue
         files.sort(key=lambda f: f.get("height", 0))
         path = os.path.join(folder, "clip.mp4")
         with open(path, "wb") as f:
-            f.write(requests.get(files[0]["link"], timeout=60).content)
+            f.write(requests.get(files[0]["url"], timeout=60).content)
         memory["used"].append(vid)
         save_memory()
         return path
