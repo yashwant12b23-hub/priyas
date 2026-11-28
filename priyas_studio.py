@@ -1156,7 +1156,7 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(app):
     # Sent once every time the bot starts, so you can see which code is running.
-    await notify(app, f"Bot started \u2705 (version: {VERSION})")
+    await notify(app, f"Bot started")
 
 
 def main():
