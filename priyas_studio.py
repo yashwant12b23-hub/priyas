@@ -1056,10 +1056,25 @@ def target_accounts(account):
         return [account]
     return list(ACCOUNTS)
 
-
-async def handle_owner_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text):
+async def speak_reply(update, text):
+    """Send the reply as a voice note too."""
+    try:
+        lang = SU.load_settings().get("reply_language", "Tamil") if SU else "English"
+        voice = "ta-IN-PallaviNeural" if lang.lower().startswith("tamil") else "en-US-AriaNeural"
+        path = Path(tempfile.gettempdir()) / f"reply_{uuid.uuid4().hex}.mp3"
+        await edge_tts.Communicate(text[:1000], voice).save(str(path))
+        with open(path, "rb") as f:
+            await update.message.reply_voice(voice=f)
+        path.unlink(missing_ok=True)
+    except Exception as e:
+        logging.warning("voice reply failed: %s", e)
+        
+async def handle_owner_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text, voice_back=False):
     app = ctx.application
-    reply = update.message.reply_text
+        async def reply(msg):
+        await update.message.reply_text(msg)
+        if voice_back:
+            await speak_reply(update, msg)
     clean = text.strip().lower().strip(".!?, ")
     waiting = waiting_pendings()
 
@@ -1203,7 +1218,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("I couldn't hear anything in that voice message.")
         return
     await update.message.reply_text(f"I heard: {text}")
-    await handle_owner_text(update, ctx, text)
+    await handle_owner_text(update, ctx, text,voice_back=True)
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
