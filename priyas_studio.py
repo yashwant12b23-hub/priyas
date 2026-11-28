@@ -1071,10 +1071,12 @@ async def speak_reply(update, text):
         
 async def handle_owner_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text, voice_back=False):
     app = ctx.application
-        async def reply(msg):
+
+    async def reply(msg):
         await update.message.reply_text(msg)
-        if voice_back:
+        if voice_back or (SU and SU.voice_active()):
             await speak_reply(update, msg)
+
     clean = text.strip().lower().strip(".!?, ")
     waiting = waiting_pendings()
 
@@ -1086,13 +1088,23 @@ async def handle_owner_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
         await reply(await approve(app, waiting[0]) if clean in YES else reject(waiting[0]))
         return
 
-        if SU:
+    if SU:
         SU.add_turn("user", text)
         _ds = SU.try_direct_setting(text)
         if _ds and SU.apply_setting(_ds[0], _ds[1]):
             await reply(f"Saved: {_ds[0]} = {_ds[1]}")
             return
-            
+        _vc = SU.parse_voice_command(text)
+        if _vc:
+            if _vc[0] == "on":
+                SU.set_voice(_vc[1])
+                await reply(f"சரி, {SU.fmt_duration(_vc[1])} வாய்ஸ்லயே பேசறேன்.")
+            else:
+                SU.set_voice(0)
+                voice_back = False
+                await reply("சரி, இனிமே டெக்ஸ்ட்லயே பேசறேன்.")
+            return
+
     # direct rule: reel/video words -> start a reel without asking the AI router
     if SU and SU.looks_like_reel_command(text):
         intent, account, value = "make_reel", (SU.guess_account(text) or "all"), None
@@ -1218,7 +1230,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("I couldn't hear anything in that voice message.")
         return
     await update.message.reply_text(f"I heard: {text}")
-    await handle_owner_text(update, ctx, text,voice_back=True)
+    await handle_owner_text(update, ctx, text, voice_back=True)
+
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
