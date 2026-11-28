@@ -1071,9 +1071,13 @@ async def handle_owner_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
         await reply(await approve(app, waiting[0]) if clean in YES else reject(waiting[0]))
         return
 
-    if SU:
+        if SU:
         SU.add_turn("user", text)
-
+        _ds = SU.try_direct_setting(text)
+        if _ds and SU.apply_setting(_ds[0], _ds[1]):
+            await reply(f"Saved: {_ds[0]} = {_ds[1]}")
+            return
+            
     # direct rule: reel/video words -> start a reel without asking the AI router
     if SU and SU.looks_like_reel_command(text):
         intent, account, value = "make_reel", (SU.guess_account(text) or "all"), None
