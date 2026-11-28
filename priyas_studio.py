@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from groq import Groq
 from PIL import Image
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters,
@@ -44,6 +45,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ======================= CONFIG =======================
+# Change this text whenever you upload a new file. The "Bot started" message shows it.
+VERSION = "merged-final-v1"
 IST = ZoneInfo("Asia/Kolkata")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -774,10 +777,16 @@ def spawn(coro):
 
 
 async def notify(app, text):
-    try:
-        await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=text[:4000])
-    except Exception as e:
-        logging.warning("notify failed: %s", e)
+    for attempt in range(3):
+        try:
+            await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=text[:4000])
+            return
+        except (TimedOut, NetworkError) as e:
+            logging.warning("notify timeout (try %s): %s", attempt + 1, e)
+            await asyncio.sleep(3)
+        except Exception as e:
+            logging.warning("notify failed: %s", e)
+            return
 
 
 def cleanup(p):
@@ -1137,12 +1146,34 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Network hiccups are normal and retried by polling; do not spam the owner.
+    if isinstance(ctx.error, (TimedOut, NetworkError)):
+        logging.warning("Telegram network error: %s", ctx.error)
+        return
     logging.error("Bot error: %s", ctx.error)
     await notify(ctx.application, f"Bot error: {str(ctx.error)[:300]}")
 
 
+async def on_startup(app):
+    # Sent once every time the bot starts, so you can see which code is running.
+    await notify(app, f"Bot started \u2705 (version: {VERSION})")
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(30)
+        .get_updates_pool_timeout(30)
+        .build()
+    )
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
@@ -1151,7 +1182,7 @@ def main():
 
     app.job_queue.run_repeating(tick, interval=300, first=15)
     app.job_queue.run_daily(daily_maintenance, time=dtime(3, 0, tzinfo=IST))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
